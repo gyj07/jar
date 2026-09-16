@@ -25,11 +25,11 @@ import java.util.regex.Pattern;
 /**
  * 神马影院 - www.smyyok.cc
  *
- * playerContent 抠 m3u8 优先级：
- *   1. <iframe src="analysis.php?v=xxx.m3u8"> → 抠 v= 参数
- *   2. player_aaaa.url 里含 url=http → 抠 url= 参数
- *   3. player_aaaa.url 直接是 m3u8 → 返回
- *   4. 全 HTML 正则匹配 → 排除包装页
+ * playerContent 流程（二次请求）：
+ *   1. 抓播放页 → 抠 player_aaaa.url
+ *   2. 如果 player_aaaa.url 是包装页（p.smyyok.com/player/?url=...）
+ *      → 请求包装页 → 从 HTML 抠 <iframe src="analysis.php?v=xxx"> 的 v= 参数
+ *   3. 返回真实 m3u8
  */
 public class ShenMa extends Spider {
 
@@ -120,73 +120,6 @@ public class ShenMa extends Spider {
             list.put(vod);
         }
         return list;
-    }
-
-    // ============================================================
-    // ★ 核心：从 HTML 抠真实 m3u8（三路尝试）
-    // ============================================================
-    private String extractM3u8FromHtml(String html) {
-        if (TextUtils.isEmpty(html)) return null;
-
-        // 【方案 1】<iframe src="analysis.php?v=xxx.m3u8">
-        Matcher iframeM = Pattern.compile(
-                "<iframe[^>]*src=[\"']([^\"']*[?&]v=(https?[^&\"'\\s]+)[^\"']*)[\"']"
-        ).matcher(html);
-        if (iframeM.find()) {
-            String u = iframeM.group(2).replace("&amp;", "&");
-            if (u.contains(".m3u8")) {
-                SpiderDebug.log("from iframe v=: " + u);
-                return u;
-            }
-        }
-
-        // 【方案 2】player_aaaa.url（含包装页二次抠）
-        Matcher pm = playerPattern.matcher(html);
-        if (pm.find()) {
-            try {
-                String raw = pm.group(1);
-                raw = raw.replaceAll("([{,])\\s*([a-zA-Z0-9_]+)\\s*:", "$1\"$2\":");
-                raw = raw.replaceAll(":\\s*'([^']*)'", ":\"$1\"");
-                raw = raw.replace("\\/", "/");
-                raw = raw.replaceAll(",\\s*}", "}");
-                JSONObject p = new JSONObject(raw);
-                String url = p.optString("url", "");
-                SpiderDebug.log("player_aaaa url=" + url);
-
-                // 2a. 包装页：从 url= 参数抠
-                if (url.contains("url=http")) {
-                    Matcher inner = Pattern.compile("[?&]url=(https?[^&\\s\"']+)").matcher(url);
-                    if (inner.find()) {
-                        String u = inner.group(1).replace("&amp;", "&");
-                        SpiderDebug.log("from player_aaaa url param: " + u);
-                        return u;
-                    }
-                }
-
-                // 2b. 直接是 m3u8
-                if (url.contains(".m3u8")) {
-                    SpiderDebug.log("from player_aaaa direct: " + url);
-                    return url;
-                }
-            } catch (Exception e) {
-                SpiderDebug.log("player_aaaa parse error: " + e.getMessage());
-            }
-        }
-
-        // 【方案 3】全 HTML 正则匹配（排除包装页）
-        Matcher mm = m3u8Pattern.matcher(html);
-        while (mm.find()) {
-            String u = mm.group(1).replace("&amp;", "&");
-            // 排除包装页 URL
-            if (u.contains("p.smyyok.com/player/")) continue;
-            if (u.contains("?url=")) continue;
-            if (u.contains(".m3u8")) {
-                SpiderDebug.log("from regex: " + u);
-                return u;
-            }
-        }
-
-        return null;
     }
 
     // ============================================================
@@ -499,7 +432,7 @@ public class ShenMa extends Spider {
     }
 
     // ============================================================
-    // playerContent
+    // ★ playerContent（二次请求版）
     // ============================================================
     @Override
     public String playerContent(String flag, String id, List<String> vipFlags) throws Exception {
@@ -514,28 +447,103 @@ public class ShenMa extends Spider {
                 return buildResult(0, id);
             }
 
-            // 2. 抓播放页
+            // 2. 抓播放页（www.smyyok.cc/vodplay/xxx.html）
             String html = req(id);
             SpiderDebug.log("html length=" + (html == null ? 0 : html.length()));
-            if (TextUtils.isEmpty(html)) {
-                return fallback(id);
+            if (TextUtils.isEmpty(html)) return fallback(id);
+
+            // 3. 从播放页抠 player_aaaa.url（可能指向包装页）
+            String wrapperUrl = extractPlayerUrl(html);
+            SpiderDebug.log("wrapper url=" + wrapperUrl);
+
+            if (TextUtils.isEmpty(wrapperUrl)) return fallback(id);
+
+            // 4. 如果 player_aaaa.url 是 m3u8 直链，直接返回
+            if (wrapperUrl.contains(".m3u8") && !wrapperUrl.contains("url=http")) {
+                SpiderDebug.log("direct m3u8 from player_aaaa");
+                return buildResult(0, wrapperUrl);
             }
 
-            // 3. 三路抠 m3u8
-            String videoUrl = extractM3u8FromHtml(html);
-            SpiderDebug.log("extracted m3u8=" + videoUrl);
+            // 5. ★ 请求包装页（p.smyyok.com/player/?url=...）
+            String wrapperHtml = req(wrapperUrl);
+            SpiderDebug.log("wrapper html length=" + (wrapperHtml == null ? 0 : wrapperHtml.length()));
+            if (TextUtils.isEmpty(wrapperHtml)) return fallback(id);
 
-            if (!TextUtils.isEmpty(videoUrl)) {
-                return buildResult(0, videoUrl);
+            // 6. ★ 从包装页 HTML 抠 <iframe src="analysis.php?v=xxx"> 的 v= 参数
+            String realM3u8 = extractFromIframeV(wrapperHtml);
+            SpiderDebug.log("from iframe v=: " + realM3u8);
+
+            if (!TextUtils.isEmpty(realM3u8)) {
+                return buildResult(0, realM3u8);
             }
 
-            // 4. 兜底：让 App 嗅探
+            // 7. 兜底：从包装页 URL 本身的 url= 参数抠
+            String fromWrapper = extractFromUrlParam(wrapperUrl);
+            SpiderDebug.log("from wrapper url=: " + fromWrapper);
+            if (!TextUtils.isEmpty(fromWrapper)) {
+                return buildResult(0, fromWrapper);
+            }
+
+            // 8. 最终兜底
             return fallback(id);
 
         } catch (Exception e) {
             SpiderDebug.log(e);
             return fallback(id);
         }
+    }
+
+    /**
+     * 从播放页 HTML 抠 player_aaaa.url
+     */
+    private String extractPlayerUrl(String html) {
+        if (TextUtils.isEmpty(html)) return null;
+        Matcher pm = playerPattern.matcher(html);
+        if (!pm.find()) return null;
+        try {
+            String raw = pm.group(1);
+            raw = raw.replaceAll("([{,])\\s*([a-zA-Z0-9_]+)\\s*:", "$1\"$2\":");
+            raw = raw.replaceAll(":\\s*'([^']*)'", ":\"$1\"");
+            raw = raw.replace("\\/", "/");
+            raw = raw.replaceAll(",\\s*}", "}");
+            JSONObject p = new JSONObject(raw);
+            return p.optString("url", "");
+        } catch (Exception e) {
+            SpiderDebug.log("player_aaaa parse error: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * ★ 从包装页 HTML 抠 <iframe src="analysis.php?v=xxx.m3u8"> 的 v= 参数
+     */
+    private String extractFromIframeV(String html) {
+        if (TextUtils.isEmpty(html)) return null;
+        Matcher m = Pattern.compile(
+                "<iframe[^>]*src=[\"'][^\"']*[?&]v=(https?[^&\"'\\s]+)[^\"']*[\"']"
+        ).matcher(html);
+        if (m.find()) {
+            String u = m.group(1).replace("&amp;", "&");
+            if (u.contains(".m3u8")) {
+                SpiderDebug.log("iframe v=: " + u);
+                return u;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 兜底：从包装页 URL 本身的 url= 参数抠
+     */
+    private String extractFromUrlParam(String url) {
+        if (TextUtils.isEmpty(url)) return null;
+        if (!url.contains("url=http")) return null;
+        Matcher m = Pattern.compile("[?&]url=(https?[^&\\s\"']+)").matcher(url);
+        if (m.find()) {
+            String u = m.group(1).replace("&amp;", "&");
+            if (u.contains(".m3u8")) return u;
+        }
+        return null;
     }
 
     private String buildResult(int parse, String url) throws Exception {
