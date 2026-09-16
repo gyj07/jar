@@ -25,7 +25,10 @@ import java.util.regex.Pattern;
 /**
  * 神马影院 - www.smyyok.cc
  *
- * playerContent 只从 player_aaaa.url 抠 m3u8，其它来源一律不用。
+ * playerContent 逻辑：
+ *   优先从 <iframe src="p.smyyok.com/player/?url=..."> 抠包装页
+ *   兜底从 player_aaaa.url 抠
+ *   两者都返回 parse:1，让 App 嗅探
  */
 public class ShenMa extends Spider {
 
@@ -426,7 +429,7 @@ public class ShenMa extends Spider {
     }
 
     // ============================================================
-    // ★ playerContent（只认 player_aaaa.url）
+    // ★ playerContent（嗅探包装页版）
     // ============================================================
     @Override
     public String playerContent(String flag, String id, List<String> vipFlags) throws Exception {
@@ -437,34 +440,34 @@ public class ShenMa extends Spider {
 
             // 1. id 本身是直链
             if (id != null && id.matches(".*\\.(m3u8|mp4|flv|mkv|webm|ts).*")) {
-                return buildResult(0, id);
+                return buildResult(id);
             }
 
             // 2. 抓播放页
             String html = req(id);
             SpiderDebug.log("html length=" + (html == null ? 0 : html.length()));
             if (TextUtils.isEmpty(html)) {
-                SpiderDebug.log("html empty -> fallback");
                 return fallback(id);
             }
 
-            // 3. 只从 player_aaaa 抠 url
+            // 3. ★ 优先从 <iframe src> 抠包装页
+            String wrapperUrl = extractIframeSrc(html);
+            SpiderDebug.log("wrapper url=" + wrapperUrl);
+
+            if (!TextUtils.isEmpty(wrapperUrl)) {
+                return buildResult(wrapperUrl);
+            }
+
+            // 4. 兜底：从 player_aaaa.url 抠
             String playerUrl = extractPlayerUrl(html);
             SpiderDebug.log("player_aaaa url=" + playerUrl);
 
-            if (TextUtils.isEmpty(playerUrl)) {
-                SpiderDebug.log("player_aaaa url empty -> fallback");
-                return fallback(id);
+            if (!TextUtils.isEmpty(playerUrl)) {
+                return buildResult(playerUrl);
             }
 
-            // 4. 只认 m3u8 直链
-            if (playerUrl.contains(".m3u8")) {
-                SpiderDebug.log("direct m3u8 -> " + playerUrl);
-                return buildResult(0, playerUrl);
-            }
-
-            // 5. 其它一律 fallback
-            SpiderDebug.log("not m3u8 -> fallback");
+            // 5. 最终兜底
+            SpiderDebug.log("all failed -> fallback");
             return fallback(id);
 
         } catch (Exception e) {
@@ -474,7 +477,24 @@ public class ShenMa extends Spider {
     }
 
     /**
-     * 从播放页 HTML 抠 player_aaaa.url
+     * 从播放页 HTML 抠 <iframe src="..."> 里的包装页地址
+     */
+    private String extractIframeSrc(String html) {
+        if (TextUtils.isEmpty(html)) return null;
+        Matcher m = Pattern.compile("<iframe[^>]*src=[\"']([^\"']+)[\"']").matcher(html);
+        if (m.find()) {
+            String src = m.group(1).replace("&amp;", "&");
+            // 只要含 player/?url 或 url=http 的（包装页）
+            if (src.contains("player/?url=") || src.contains("url=http")) {
+                SpiderDebug.log("iframe src: " + src);
+                return src;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 从播放页 HTML 抠 player_aaaa.url（兜底）
      */
     private String extractPlayerUrl(String html) {
         if (TextUtils.isEmpty(html)) return null;
@@ -497,9 +517,12 @@ public class ShenMa extends Spider {
         }
     }
 
-    private String buildResult(int parse, String url) throws Exception {
+    /**
+     * 构造返回：写死 parse=1，让 App 嗅探
+     */
+    private String buildResult(String url) throws Exception {
         JSONObject result = new JSONObject();
-        result.put("parse", parse);
+        result.put("parse", 1);
         result.put("url", url);
         result.put("header", headerToJson(getM3u8Header()));
         String s = result.toString();
