@@ -23,23 +23,20 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * 神马影院 - www.smyyok.com
- * playerContent 返回 {"parse":0/1,"url":"..."}
+ * 神马影院 - www.smyyok.cc
+ * playerContent 返回 {"parse":0/1,"url":"...","header":{...}}
  */
 public class ShenMa extends Spider {
 
-    private final String siteUrl = "https://www.smyyok.com";
+    // ★ Bug1 修复：.com 是入口页，.cc 才是真站
+    private final String siteUrl = "https://www.smyyok.cc";
 
-    private final String userAgent =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-    // 兼容嵌套 JSON：player_aaaa = {...}</script>
-    private static final Pattern playerPattern = Pattern.compile(
-            "player_aaaa\\s*=\\s*(\\{.*?\\})\\s*</script>", Pattern.DOTALL);
+    private final String userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
     private static final Pattern m3u8Pattern = Pattern.compile(
             "(https?://[^\\s<>\"']+\\.m3u8[^\\s<>\"']*)");
+    private static final Pattern playerPattern = Pattern.compile(
+            "var\\s+player_aaaa\\s*=\\s*(\\{[\\s\\S]*?\\})\\s*;");
 
     // ============================================================
     // header
@@ -51,26 +48,30 @@ public class ShenMa extends Spider {
         return header;
     }
 
-    private Map<String, String> getHeaderForPlay() {
+    // ★ Bug2 修复：m3u8 专用 header，带 Referer + Origin
+    private Map<String, String> getM3u8Header() {
         Map<String, String> header = new HashMap<>();
         header.put("User-Agent", userAgent);
         header.put("Referer", siteUrl + "/");
+        header.put("Origin", siteUrl);
         header.put("Accept", "*/*");
         return header;
-    }
-
-    private JSONObject headerToJson(Map<String, String> map) throws Exception {
-        JSONObject o = new JSONObject();
-        for (Map.Entry<String, String> e : map.entrySet()) o.put(e.getKey(), e.getValue());
-        return o;
     }
 
     private String req(String url) {
         return OkHttp.string(url, getHeader());
     }
 
+    private JSONObject headerToJson(Map<String, String> map) throws Exception {
+        JSONObject obj = new JSONObject();
+        if (map != null) for (Map.Entry<String, String> e : map.entrySet()) {
+            obj.put(e.getKey(), e.getValue());
+        }
+        return obj;
+    }
+
     // ============================================================
-    // buildVodShowUrl（保持原样，不改）
+    // buildVodShowUrl（11 个 '-'）
     // ============================================================
     private String buildVodShowUrl(String tid, String area, String sort, String pg, String year, String cls) {
         String[] parts = new String[12];
@@ -120,6 +121,35 @@ public class ShenMa extends Spider {
     }
 
     // ============================================================
+    // 提取 m3u8
+    // ============================================================
+    private String extractM3u8(String html) {
+        if (TextUtils.isEmpty(html)) return null;
+
+        Matcher pm = playerPattern.matcher(html);
+        if (pm.find()) {
+            try {
+                String raw = pm.group(1);
+                raw = raw.replaceAll("([{,])\\s*([a-zA-Z0-9_]+)\\s*:", "$1\"$2\":");
+                raw = raw.replaceAll(":\\s*'([^']*)'", ":\"$1\"");
+                raw = raw.replace("\\/", "/");
+                raw = raw.replaceAll(",\\s*}", "}");
+                JSONObject p = new JSONObject(raw);
+                String url = p.optString("url", "");
+                if (!TextUtils.isEmpty(url) && url.contains(".m3u8")) {
+                    return url;
+                }
+            } catch (Exception e) {
+                SpiderDebug.log("player_aaaa parse error: " + e.getMessage());
+            }
+        }
+
+        Matcher mm = m3u8Pattern.matcher(html);
+        if (mm.find()) return mm.group(1);
+        return null;
+    }
+
+    // ============================================================
     // 首页
     // ============================================================
     @Override
@@ -137,7 +167,9 @@ public class ShenMa extends Spider {
         }
         result.put("class", classes);
 
-        if (filter) result.put("filters", buildFilters());
+        if (filter) {
+            result.put("filters", buildFilters());
+        }
 
         try {
             String html = req(siteUrl + "/");
@@ -427,7 +459,7 @@ public class ShenMa extends Spider {
     }
 
     // ============================================================
-    // ★ playerContent（XingYiYing 方式）
+    // ★ playerContent（带 header）
     // ============================================================
     @Override
     public String playerContent(String flag, String id, List<String> vipFlags) throws Exception {
@@ -435,66 +467,32 @@ public class ShenMa extends Spider {
             // 1. id 本身是直链
             if (id != null && Pattern.compile("\\.(m3u8|mp4|flv|mkv|webm|ts)",
                     Pattern.CASE_INSENSITIVE).matcher(id).find()) {
-                JSONObject r = new JSONObject();
-                r.put("parse", 0);
-                r.put("url", id);
-                r.put("header", headerToJson(getHeaderForPlay()));
-                return r.toString();
+                JSONObject result = new JSONObject();
+                result.put("parse", 0);
+                result.put("url", id);
+                result.put("header", headerToJson(getM3u8Header()));   // ★ 修复
+                return result.toString();
             }
 
-            // 2. 请求播放页
+            // 2. 抓播放页
             String html = req(id);
-            android.util.Log.d("ShenMa", "P1 url=" + id);
-            android.util.Log.d("ShenMa", "P2 len=" + (html == null ? 0 : html.length()));
-
-            if (TextUtils.isEmpty(html)) return fallback(id);
-
-            // 3. 抠 player_aaaa
-            Matcher pm = playerPattern.matcher(html);
-            if (pm.find()) {
-                String raw = pm.group(1);
-                android.util.Log.d("ShenMa", "P3 player_aaaa="
-                        + raw.substring(0, Math.min(300, raw.length())));
-                try {
-                    JSONObject p = new JSONObject(raw);
-                    String realUrl = p.optString("url", "");
-                    String from = p.optString("from", "");
-                    android.util.Log.d("ShenMa", "P4 realUrl=" + realUrl + ", from=" + from);
-
-                    if (realUrl.contains(".m3u8") || realUrl.contains(".mp4")) {
-                        JSONObject r = new JSONObject();
-                        r.put("parse", 0);
-                        r.put("url", realUrl);
-                        r.put("header", headerToJson(getHeaderForPlay()));
-                        return r.toString();
-                    }
-                    if (!TextUtils.isEmpty(realUrl)) {
-                        JSONObject r = new JSONObject();
-                        r.put("parse", 1);
-                        r.put("url", realUrl);
-                        r.put("header", headerToJson(getHeader()));
-                        return r.toString();
-                    }
-                } catch (Exception e) {
-                    SpiderDebug.log("player_aaaa parse error: " + e.getMessage());
-                }
-            } else {
-                android.util.Log.d("ShenMa", "P3 player_aaaa 未找到");
+            if (TextUtils.isEmpty(html)) {
+                return fallback(id);
             }
 
-            // 4. 页面里直接找 m3u8
-            Matcher mm = m3u8Pattern.matcher(html);
-            if (mm.find()) {
-                String direct = mm.group(1);
-                android.util.Log.d("ShenMa", "P5 regex m3u8=" + direct);
-                JSONObject r = new JSONObject();
-                r.put("parse", 0);
-                r.put("url", direct);
-                r.put("header", headerToJson(getHeaderForPlay()));
-                return r.toString();
+            // 3. 抠 m3u8
+            String videoUrl = extractM3u8(html);
+            SpiderDebug.log("extracted m3u8=" + videoUrl);
+            if (!TextUtils.isEmpty(videoUrl)) {
+                JSONObject result = new JSONObject();
+                result.put("parse", 0);
+                result.put("url", videoUrl);
+                result.put("header", headerToJson(getM3u8Header()));   // ★ 修复
+                SpiderDebug.log("RETURN=" + result.toString());
+                return result.toString();
             }
 
-            // 5. 兜底
+            // 4. 兜底
             return fallback(id);
         } catch (Exception e) {
             SpiderDebug.log(e);
@@ -503,11 +501,12 @@ public class ShenMa extends Spider {
     }
 
     private String fallback(String id) throws Exception {
-        JSONObject r = new JSONObject();
-        r.put("parse", 1);
-        r.put("url", id);
-        r.put("header", headerToJson(getHeader()));
-        return r.toString();
+        JSONObject result = new JSONObject();
+        result.put("parse", 1);
+        result.put("url", id);
+        result.put("header", headerToJson(getHeader()));
+        SpiderDebug.log("FALLBACK=" + result.toString());
+        return result.toString();
     }
 
     // ============================================================
