@@ -1,4 +1,4 @@
-name: Build Spider Jar
+name: Build cat_Spider Jar
 
 on:
   workflow_dispatch:
