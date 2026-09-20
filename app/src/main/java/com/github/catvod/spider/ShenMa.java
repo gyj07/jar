@@ -786,7 +786,7 @@ public class ShenMa extends Spider {
     // ============================================================
     // destroy
     // ============================================================
-    @Override
+  
     public void destroy() {
         SpiderDebug.log("ShenMa destroy");
     }
