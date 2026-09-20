@@ -754,4 +754,42 @@ public class ShenMa extends Spider {
                         }
                     }
                 } catch (Exception e) {
+                    SpiderDebug.log("player_aaaa parse error: " + e.getMessage());
+                }
+            }
+
+            String m3u8 = group("(https?:\\/\\/[^\\s<>\"']+\\.m3u8[^\\s<>\"']*)", html, 1);
+            if (!m3u8.isEmpty()) {
+                SpiderDebug.log("regex m3u8: " + m3u8);
+                return buildResult(0, cleanUrl(m3u8), getM3u8Headers());
+            }
+
+            return buildResult(1, id, getHeaders());
+        } catch (Exception e) {
+            SpiderDebug.log("playerContent error: " + e.getMessage());
+            return "";
+        }
+    }
+
+    private String buildResult(int parse, String url, Map<String, String> h) {
+        try {
+            JSONObject r = new JSONObject();
+            r.put("parse", parse);
+            r.put("url", url);
+            if (h != null) {
+                JSONObject hObj = new JSONObject();
+                for (Map.Entry<String, String> e : h.entrySet()) hObj.put(e.getKey(), e.getValue());
+                r.put("header", hObj);
+            }
+            return r.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    @Override
+    public void destroy() {
+        SpiderDebug.log("ShenMa destroy");
+    }
+}
          
